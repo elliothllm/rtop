@@ -1,0 +1,38 @@
+# Build output
+bin/
+obj/
+artifacts/
+*.nupkg
+*.snupkg
+
+# .NET / MSBuild noise
+*.binlog
+msbuild.log
+project.lock.json
+*.user
+*.suo
+.vs/
+TestResults/
+[Dd]ebug/
+[Rr]elease/
+BenchmarkDotNet.Artifacts/
+
+# Local tooling and secrets
+.env
+.env.*
+*.local.json
+appsettings.Development.json
+appsettings.Local.json
+.dotnet/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
