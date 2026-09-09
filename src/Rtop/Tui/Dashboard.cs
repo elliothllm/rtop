@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 using Rtop.Config;
 using Rtop.Core;
 using Rtop.Logs;
@@ -16,6 +17,13 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
     private sealed record Row(Worktree Worktree, DotnetProcess? Process)
     {
         public bool IsProcess => Process is not null;
+    }
+
+    /// <summary>Which pane the arrow keys are driving.</summary>
+    private enum Pane
+    {
+        List,
+        Log,
     }
 
     private readonly Discovery _discovery = new(config);
@@ -45,6 +53,17 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
     private LogFilter _logFilter = LogFilter.Default;
     private Task<IReadOnlyList<string>>? _logTask;
     private DateTimeOffset _lastLogRead = DateTimeOffset.MinValue;
+
+    private Pane _focus = Pane.List;
+
+    /// <summary>The log line being read in full, or -1 when the log pane has no cursor.</summary>
+    private int _logCursor = -1;
+
+    /// <summary>Its text, so the cursor can follow that line as the tail scrolls underneath it.</summary>
+    private string? _logCursorText;
+
+    private int _logWindowStart;
+    private int _logWindowEnd;
 
     private bool _dirty = true;
     private DateTimeOffset _lastDraw = DateTimeOffset.MinValue;
@@ -202,6 +221,7 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
             _logScroll = 0;
             _lastLogRead = DateTimeOffset.MinValue;
             _logTask = null;
+            FocusList();
         }
 
         if (_logTask is { IsCompleted: true } finished)
@@ -216,6 +236,8 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
             {
                 _logLines = [$"Reading the log failed: {error.Message}"];
             }
+
+            Reanchor();
         }
 
         if (_logSource is not null && _logTask is null
@@ -245,6 +267,108 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
             : new UnreadableLogSource(process.Output, seqConfigured: false);
     }
 
+    /// <summary>
+    /// The tail is a window that slides: when lines arrive at the bottom, everything already in it
+    /// shifts up by as many. Follow the line being read by its text, so the cursor stays on the
+    /// entry the reader put it on rather than on whatever now holds that index.
+    /// </summary>
+    private void Reanchor()
+    {
+        if (_logCursor < 0)
+        {
+            return;
+        }
+
+        if (_logLines.Count == 0)
+        {
+            FocusList();
+            return;
+        }
+
+        if (_logCursorText is null || (_logCursor < _logLines.Count && _logLines[_logCursor] == _logCursorText))
+        {
+            _logCursor = Math.Min(_logCursor, _logLines.Count - 1);
+            return;
+        }
+
+        for (var distance = 1; distance <= _logLines.Count; distance++)
+        {
+            foreach (var candidate in (int[])[_logCursor - distance, _logCursor + distance])
+            {
+                if (candidate >= 0 && candidate < _logLines.Count && _logLines[candidate] == _logCursorText)
+                {
+                    _logCursor = candidate;
+                    return;
+                }
+            }
+        }
+
+        // The line has fallen out of the tail altogether; leave the cursor where it is.
+        _logCursor = Math.Clamp(_logCursor, 0, _logLines.Count - 1);
+        _logCursorText = _logLines[_logCursor];
+    }
+
+    private void FocusLog()
+    {
+        if (_logLines.Count == 0)
+        {
+            _status = "no log lines to read";
+            return;
+        }
+
+        _focus = Pane.Log;
+
+        if (_logCursor < 0)
+        {
+            SetLogCursor(Math.Max(0, (_logWindowEnd > 0 ? _logWindowEnd : _logLines.Count) - 1));
+        }
+    }
+
+    private void FocusList()
+    {
+        _focus = Pane.List;
+        _logCursor = -1;
+        _logCursorText = null;
+    }
+
+    private void MoveLogCursor(int delta)
+    {
+        if (_logLines.Count == 0)
+        {
+            return;
+        }
+
+        SetLogCursor((_logCursor < 0 ? _logWindowEnd - 1 : _logCursor) + delta);
+    }
+
+    private void SetLogCursor(int index)
+    {
+        var total = _logLines.Count;
+
+        if (total == 0)
+        {
+            return;
+        }
+
+        _logCursor = Math.Clamp(index, 0, total - 1);
+        _logCursorText = _logLines[_logCursor];
+
+        // Move the window with the cursor in one step, from where the last frame actually landed,
+        // rather than nudging it a row at a time until the cursor comes back into view.
+        var end = _logWindowEnd > 0 ? _logWindowEnd : total;
+
+        if (_logCursor >= end)
+        {
+            end = _logCursor + 1;
+        }
+        else if (_logCursor < _logWindowStart)
+        {
+            end -= _logWindowStart - _logCursor;
+        }
+
+        _logScroll = Math.Clamp(total - end, 0, Math.Max(0, total - 1));
+    }
+
     // --- Input --------------------------------------------------------------
 
     private void DrainKeys()
@@ -271,45 +395,87 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
             return;
         }
 
+        var page = Math.Max(1, LogHeight() - 1);
+
         switch (key.Key)
         {
+            case ConsoleKey.Tab:
+                if (_focus == Pane.Log)
+                {
+                    FocusList();
+                }
+                else
+                {
+                    FocusLog();
+                }
+
+                return;
+
+            case ConsoleKey.Enter:
+                FocusLog();
+                return;
+
             case ConsoleKey.UpArrow:
-                Move(-1);
+                Up(1);
                 return;
 
             case ConsoleKey.DownArrow:
-                Move(1);
+                Down(1);
                 return;
 
             case ConsoleKey.PageUp:
-                _logScroll += Math.Max(1, LogHeight() - 1);
+                Up(page);
                 return;
 
             case ConsoleKey.PageDown:
-                _logScroll = Math.Max(0, _logScroll - Math.Max(1, LogHeight() - 1));
+                Down(page);
                 return;
 
             case ConsoleKey.Home:
-                _logScroll = Math.Max(0, _logLines.Count - LogHeight());
+                if (_focus == Pane.Log)
+                {
+                    SetLogCursor(0);
+                }
+                else
+                {
+                    _logScroll = Math.Max(0, _logLines.Count - LogHeight());
+                }
+
                 return;
 
             case ConsoleKey.End:
-                _logScroll = 0;
+                if (_focus == Pane.Log)
+                {
+                    SetLogCursor(_logLines.Count - 1);
+                }
+                else
+                {
+                    _logScroll = 0;
+                }
+
                 return;
 
             case ConsoleKey.Escape:
-                _running = false;
+                if (_focus == Pane.Log)
+                {
+                    FocusList();
+                }
+                else
+                {
+                    _running = false;
+                }
+
                 return;
         }
 
         switch (char.ToLowerInvariant(key.KeyChar))
         {
             case 'k':
-                Move(-1);
+                Up(1);
                 break;
 
             case 'j':
-                Move(1);
+                Down(1);
                 break;
 
             case 'q':
@@ -366,6 +532,42 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
             case 's':
                 AskToStop();
                 break;
+        }
+    }
+
+    /// <summary>
+    /// Up and down drive whichever pane has focus: the list selection, or the log cursor once the
+    /// log pane has been stepped into.
+    /// </summary>
+    private void Up(int lines)
+    {
+        if (_focus == Pane.Log)
+        {
+            MoveLogCursor(-lines);
+        }
+        else if (lines == 1)
+        {
+            Move(-1);
+        }
+        else
+        {
+            _logScroll = Math.Clamp(_logScroll + lines, 0, Math.Max(0, _logLines.Count - 1));
+        }
+    }
+
+    private void Down(int lines)
+    {
+        if (_focus == Pane.Log)
+        {
+            MoveLogCursor(lines);
+        }
+        else if (lines == 1)
+        {
+            Move(1);
+        }
+        else
+        {
+            _logScroll = Math.Max(0, _logScroll - lines);
         }
     }
 
@@ -440,37 +642,38 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
 
     // --- Rendering ----------------------------------------------------------
 
-    private int Width => Math.Max(40, AnsiConsole.Profile.Width);
+    private int Width => Math.Max(20, AnsiConsole.Profile.Width);
 
     private int Height => Math.Max(12, AnsiConsole.Profile.Height);
 
-    private int ListHeight() => Math.Clamp(_rows.Count, 3, Math.Max(3, (Height - 6) / 2));
+    /// <summary>Rows for the two panes to divide: what the header, footer and borders leave over.</summary>
+    private int Available => Math.Max(2, Height - 7);
 
-    private int LogHeight() => Math.Max(3, Height - 7 - ListHeight());
+    private int ListHeight() => Math.Clamp(Math.Max(_rows.Count, 3), 1, Math.Max(1, Available / 2));
+
+    private int LogHeight() => Math.Max(1, Available - ListHeight());
 
     /// <summary>
     /// The whole screen, built to exactly one row less than the terminal. Filling every row would
     /// make the trailing newline scroll the display, and the header would be the line lost.
     /// </summary>
-    private IRenderable Frame()
-    {
-        var listHeight = ListHeight();
-        var logHeight = Math.Max(3, Height - 7 - listHeight);
-
-        return new Rows(Header(), ListPanel(listHeight), LogPanel(logHeight), Footer());
-    }
-
+    private IRenderable Frame() =>
+        new Rows(Header(), ListPanel(ListHeight()), LogPanel(LogHeight()), Footer());
 
     private IRenderable Header()
     {
         var processes = _snapshot.RunningProcessCount;
         var worktrees = _snapshot.RunningWorktreeCount;
+
         var summary = processes == 0
             ? "[grey]nothing running[/]"
-            : $"[green]{processes}[/] process{(processes == 1 ? "" : "es")} in [green]{worktrees}[/] worktree{(worktrees == 1 ? "" : "s")}";
+            : Width < 44
+                ? $"[green]{processes}[/] in [green]{worktrees}[/]"
+                : $"[green]{processes}[/] process{(processes == 1 ? "" : "es")} in [green]{worktrees}[/] worktree{(worktrees == 1 ? "" : "s")}";
 
-        var right = $"[grey]{_snapshot.TakenAt:HH:mm:ss}[/]";
         var left = $"[bold]rtop[/]  {summary}";
+        var clock = $"{_snapshot.TakenAt:HH:mm:ss}";
+        var right = Plain(left).Length + 1 + clock.Length <= Width ? $"[grey]{clock}[/]" : "";
 
         return new Markup(Justify(left, right, Width));
     }
@@ -478,66 +681,160 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
     private IRenderable ListPanel(int height)
     {
         var inner = Width - 4;
+        var focused = _focus == Pane.List;
 
         if (_rows.Count == 0)
         {
             var message = _runningOnly
-                ? "Nothing running. Press [bold]a[/] to show idle worktrees too."
+                ? "Nothing running. Press a to show idle worktrees too."
                 : "No worktrees found. Run rtop from inside a git repository, or add one to the config.";
 
-            return Framed(new Rows(PadTo([new Markup($"[grey]{message}[/]")], height)), "worktrees");
+            return Framed(new Rows(PadTo([Note(message, inner)], height)), "worktrees", focused);
         }
 
         // Keep the selected row inside the window.
         _listOffset = Math.Clamp(_listOffset, Math.Max(0, _selected - height + 1), Math.Max(0, _selected));
         _listOffset = Math.Min(_listOffset, Math.Max(0, _rows.Count - height));
 
+        // One column layout for the whole table, so the columns still line up with each other once
+        // some of them have been shed.
+        var columns = ProcessColumns.For(
+            inner,
+            _rows.Select(row => row.Process is { } process ? Cells(PortsText(process)) + 2 : 0)
+                .DefaultIfEmpty(8)
+                .Max());
+
         var lines = new List<IRenderable>();
 
         for (var index = _listOffset; index < Math.Min(_rows.Count, _listOffset + height); index++)
         {
-            lines.Add(new Markup(RenderRow(_rows[index], index == _selected, inner)));
+            lines.Add(new Markup(RenderRow(_rows[index], index == _selected, inner, columns)));
         }
 
-        var scrollHint = _rows.Count > height ? $"  [grey]{_listOffset + 1}-{Math.Min(_rows.Count, _listOffset + height)} of {_rows.Count}[/]" : "";
-        return Framed(new Rows(PadTo(lines, height)), $"worktrees{scrollHint}");
+        var scrollHint = _rows.Count > height
+            ? $"  [grey]{_listOffset + 1}-{Math.Min(_rows.Count, _listOffset + height)} of {_rows.Count}[/]"
+            : "";
+
+        return Framed(new Rows(PadTo(lines, height)), $"worktrees{scrollHint}", focused);
     }
 
-    private string RenderRow(Row row, bool selected, int width)
+    private string RenderRow(Row row, bool selected, int width, ProcessColumns columns)
     {
-        var text = row.Process is { } process ? ProcessLine(process, row.Worktree) : WorktreeLine(row.Worktree);
+        var text = row.Process is { } process ? ProcessLine(process, columns) : WorktreeLine(row.Worktree, width);
         var padded = Pad(text, width);
 
-        return selected
+        if (!selected)
+        {
+            return Colourise(row, padded);
+        }
+
+        // Dim the bar while the log pane has the arrow keys, so it is never ambiguous which pane
+        // the next keypress is going to move.
+        return _focus == Pane.List
             ? $"[black on steelblue1]{Markup.Escape(padded)}[/]"
-            : Colourise(row, padded);
+            : $"[black on grey58]{Markup.Escape(padded)}[/]";
     }
 
-    private static string WorktreeLine(Worktree worktree)
+    /// <summary>
+    /// The worktree's name is its identity and the branch is context, so a narrow terminal gives up
+    /// the branch before it gives up the end of the name.
+    /// </summary>
+    private static string WorktreeLine(Worktree worktree, int width)
     {
         var dot = worktree.IsRunning ? "*" : "-";
         var tag = worktree.IsClaudeWorktree ? " [claude]" : worktree.IsMain ? " [main]" : "";
-        var branch = worktree.Branch is null ? "" : $"  {worktree.Branch}";
+        var name = Fit(worktree.Name, Math.Max(4, width - 2 - Cells(tag)), pad: false);
+        var head = $"{dot} {name}{tag}";
 
-        return $"{dot} {worktree.Name}{tag}{branch}";
+        if (worktree.Branch is null)
+        {
+            return head;
+        }
+
+        var room = width - Cells(head) - 2;
+        return room < 6 ? head : $"{head}  {Fit(worktree.Branch, room, pad: false)}";
     }
 
-    private static string ProcessLine(DotnetProcess process, Worktree worktree)
+    private static string ProcessLine(DotnetProcess process, ProcessColumns columns)
     {
-        var ports = process.Ports.Count == 0 ? "-" : string.Join(",", process.Ports);
-        var log = process.Output.Kind switch
+        var kind = process.Output.Kind switch
         {
             OutputKind.File => "log",
             OutputKind.Terminal => "tty",
             _ => "?",
         };
 
-        return "    "
-             + Fit(process.Name, 26)
-             + Fit($"pid {process.Pid}", 12)
-             + Fit(ports, 16)
-             + Fit(Uptime(process.Elapsed), 9)
-             + log;
+        return new string(' ', columns.Indent)
+             + Fit(process.Name, columns.Name)
+             + Fit($"pid {process.Pid}", columns.Pid)
+             + Fit(PortsText(process), columns.Ports)
+             + Fit(Uptime(process.Elapsed), columns.Uptime)
+             + Fit(kind, columns.Kind, pad: false);
+    }
+
+    private static string PortsText(DotnetProcess process) =>
+        process.Ports.Count == 0 ? "-" : string.Join(",", process.Ports);
+
+    /// <summary>
+    /// How wide each column of a process row is at the current terminal width, where zero means the
+    /// column is not drawn at all. The ports are the one thing the row exists to answer — which
+    /// copy of the service is on which port — so every other column goes before they are touched.
+    /// </summary>
+    private readonly record struct ProcessColumns(int Indent, int Name, int Pid, int Ports, int Uptime, int Kind)
+    {
+        public static ProcessColumns For(int width, int portsNeeded)
+        {
+            var indent = 4;
+            var name = 26;
+            var pid = 12;
+            var ports = Math.Clamp(portsNeeded, 8, 22);
+            var uptime = 9;
+            var kind = 3;
+
+            int Over() => indent + name + pid + ports + uptime + kind - width;
+
+            // Shed in order of how little each is worth once the space is not there.
+            if (Over() > 0)
+            {
+                kind = 0;
+            }
+
+            if (Over() > 0)
+            {
+                uptime = 0;
+            }
+
+            if (Over() > 0)
+            {
+                name = Math.Max(14, name - Over());
+            }
+
+            if (Over() > 0)
+            {
+                pid = 0;
+            }
+
+            if (Over() > 0)
+            {
+                indent = 2;
+            }
+
+            if (Over() > 0)
+            {
+                name = Math.Max(4, name - Over());
+            }
+
+            // Only now, with nothing else left to give, may the ports themselves be truncated.
+            if (Over() > 0)
+            {
+                ports = Math.Max(4, ports - Over());
+            }
+
+            // Dropping a column usually overshoots; hand what that freed back to the name.
+            name = Math.Clamp(name - Over(), 4, 26);
+
+            return new ProcessColumns(indent, name, pid, ports, uptime, kind);
+        }
     }
 
     /// <summary>
@@ -560,38 +857,47 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
     {
         var width = Width - 4;
         var row = CurrentRow();
+        var focused = _focus == Pane.Log;
 
         if (row is null)
         {
-            return Framed(new Rows(PadTo([new Markup("[grey]Nothing selected.[/]")], height)), "log");
+            return Framed(new Rows(PadTo([Note("Nothing selected.", width)], height)), "log", focused);
         }
 
         if (row.Process is null)
         {
             var message = row.Worktree.IsRunning
                 ? "Select a process below this worktree to tail its log."
-                : $"Nothing is running in {Markup.Escape(row.Worktree.Path)}.";
+                : $"Nothing is running in {row.Worktree.Path}.";
 
-            return Framed(new Rows(PadTo([new Markup($"[grey]{message}[/]")], height)), "log");
+            return Framed(new Rows(PadTo([Note(message, width)], height)), "log", focused);
         }
 
-        var total = _logLines.Count;
-        var end = Math.Max(0, total - _logScroll);
-        var start = Math.Max(0, end - height);
-        var window = PadTo(
-            [.. _logLines.Skip(start).Take(end - start).Select(line => new Markup(LogLine(line, width)))],
-            height);
+        return Framed(new Rows(LogWindow(width, height)), LogHeader(row.Process.Name, width), focused);
+    }
 
-        var header = $"log  {Markup.Escape(row.Process.Name)}";
+    /// <summary>
+    /// The pane's title, assembled from whatever fits: the process name always, then each note in
+    /// turn, where a note takes only what the notes after it have not already claimed.
+    /// </summary>
+    private string LogHeader(string name, int width)
+    {
+        // Only the source description reads sensibly cut short; a counter that says "line 1…" is
+        // worse than no counter, so the rest are all or nothing.
+        List<(string Text, string Colour, bool Truncatable)> notes = [];
+
         if (_logSource is not null)
         {
-            var room = Math.Max(10, width - Cells(row.Process.Name) - 40);
-            header += $"  [grey]{Markup.Escape(Fit(_logSource.Description, room, pad: false))}[/]";
+            notes.Add((_logSource.Description, "grey", true));
         }
 
-        if (_logScroll > 0)
+        if (_focus == Pane.Log)
         {
-            header += $"  [yellow]scrolled +{_logScroll}[/]";
+            notes.Add(($"line {_logCursor + 1} of {_logLines.Count}", "steelblue1", false));
+        }
+        else if (_logScroll > 0)
+        {
+            notes.Add(($"scrolled +{_logScroll}", "yellow", false));
         }
 
         if (_logSource?.SupportsFiltering == true)
@@ -602,15 +908,124 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
                 LevelFloor.Errors => "errors",
                 _ => "all",
             };
-            header += $"  [grey]{(_logFilter.ApplicationOnly ? "app-only" : "everything")} / {floor}[/]";
+
+            notes.Add(($"{(_logFilter.ApplicationOnly ? "app-only" : "everything")} / {floor}", "grey", false));
         }
 
-        return Framed(new Rows(window), header);
+        var header = $"log  {Markup.Escape(name)}";
+        var used = 5 + Cells(name);
+
+        for (var index = 0; index < notes.Count; index++)
+        {
+            var reserve = notes.Skip(index + 1).Sum(note => 2 + Cells(note.Text));
+            var room = width - used - 2 - reserve;
+            var note = notes[index];
+
+            if (room < (note.Truncatable ? 6 : Cells(note.Text)))
+            {
+                continue;
+            }
+
+            var text = note.Truncatable ? Fit(note.Text, room, pad: false) : note.Text;
+            header += $"  [{note.Colour}]{Markup.Escape(text)}[/]";
+            used += 2 + Cells(text);
+        }
+
+        return header;
+    }
+
+    /// <summary>
+    /// The visible tail. Every line is one row except the one being read, which is wrapped over as
+    /// many rows as its text needs — so the window has to be filled upwards from the bottom rather
+    /// than sliced out of the list by index.
+    /// </summary>
+    private List<IRenderable> LogWindow(int width, int height)
+    {
+        var total = _logLines.Count;
+
+        if (total == 0)
+        {
+            _logWindowStart = 0;
+            _logWindowEnd = 0;
+            return PadTo([], height);
+        }
+
+        var wrapRows = Math.Clamp(height - 1, 1, 12);
+        var end = Math.Clamp(total - _logScroll, 1, total);
+
+        if (_logCursor >= end)
+        {
+            end = _logCursor + 1;
+        }
+
+        var rows = new List<IRenderable>();
+        var start = end;
+
+        // Wrapping can push the line being read off the top of the window, or leave only its last
+        // few rows showing. Either way, give the bottom row back and fill again until the whole of
+        // it is on screen.
+        for (var attempt = 0; attempt <= wrapRows; attempt++)
+        {
+            rows.Clear();
+            start = end;
+            var clipped = false;
+
+            while (start > 0 && rows.Count < height)
+            {
+                var entry = Entry(start - 1, width, wrapRows);
+                var room = height - rows.Count;
+
+                if (entry.Count > room)
+                {
+                    clipped |= start - 1 == _logCursor;
+                    rows.InsertRange(0, entry.Skip(entry.Count - room));
+                }
+                else
+                {
+                    rows.InsertRange(0, entry);
+                }
+
+                start--;
+            }
+
+            if (_logCursor < 0 || (_logCursor >= start && !clipped) || end <= _logCursor + 1)
+            {
+                break;
+            }
+
+            end--;
+        }
+
+        _logWindowStart = start;
+        _logWindowEnd = end;
+        _logScroll = Math.Max(0, total - end);
+
+        return PadTo(rows, height);
+    }
+
+    private List<IRenderable> Entry(int index, int width, int maxRows)
+    {
+        var line = _logLines[index];
+
+        if (index != _logCursor)
+        {
+            return [new Markup(LogLine(line, width))];
+        }
+
+        // The line being read is the one place the whole text is shown. Highlighting every row of
+        // it, padded out to the full width, keeps the block reading as a single entry.
+        return
+        [
+            .. Wrap(line, width, maxRows)
+                .Select(part => (IRenderable)new Markup($"[black on steelblue1]{Markup.Escape(Pad(part, width))}[/]")),
+        ];
     }
 
     private static string LogLine(string line, int width)
     {
-        var text = Markup.Escape(Fit(line, width, pad: false));
+        // A renderable with no text at all occupies no row, which would silently shorten the pane
+        // by one for every blank line in the log — and a tail always ends with one.
+        var text = line.Length == 0 ? " " : Markup.Escape(Fit(line, width, pad: false));
 
         if (line.Contains(" ERR", StringComparison.Ordinal) || line.Contains("error", StringComparison.OrdinalIgnoreCase)
             || line.Contains("fail", StringComparison.OrdinalIgnoreCase) || line.Contains("Exception", StringComparison.Ordinal))
@@ -633,28 +1048,82 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
             return new Markup($"[black on yellow] {Markup.Escape(Pad(_confirmPrompt, Width - 2))} [/]");
         }
 
-        var keys = "[grey]↑↓[/] select  [grey]o[/]pen  [grey]s[/]top  [grey]a[/]ll  [grey]t[/]oggle src  "
-                 + "[grey]f[/]ilter  [grey]l[/]evel  [grey]PgUp/PgDn[/] scroll  [grey]q[/]uit";
+        var status = _status is null ? "" : Fit(_status, Math.Max(8, Width / 2), pad: false);
+        var room = Width - (status.Length == 0 ? 0 : status.Length + 2);
 
-        return new Markup(Justify(keys, _status is null ? "" : $"[grey]{Markup.Escape(_status)}[/]", Width));
+        // The text, how much of it is the key, and how readily it is dropped when the terminal is
+        // too narrow to advertise everything. Every key still works whether or not it is listed.
+        (string Text, int Key, int Drop)[] keys = _focus == Pane.Log
+            ?
+            [
+                ("↑↓ line", 2, 0),
+                ("esc back", 3, 1),
+                ("Home/End ends", 8, 5),
+                ("open", 1, 3),
+                ("stop", 1, 4),
+                ("quit", 1, 2),
+            ]
+            :
+            [
+                ("↑↓ select", 2, 0),
+                ("tab read log", 3, 2),
+                ("open", 1, 3),
+                ("stop", 1, 4),
+                ("all", 1, 5),
+                ("toggle src", 1, 8),
+                ("filter", 1, 7),
+                ("level", 1, 6),
+                ("PgUp/PgDn scroll", 9, 9),
+                ("quit", 1, 1),
+            ];
+
+        var shown = new HashSet<int>();
+        var budget = room;
+
+        foreach (var index in Enumerable.Range(0, keys.Length).OrderBy(index => keys[index].Drop))
+        {
+            var cost = keys[index].Text.Length + (shown.Count == 0 ? 0 : 2);
+
+            if (cost <= budget)
+            {
+                budget -= cost;
+                shown.Add(index);
+            }
+        }
+
+        var line = string.Join("  ", Enumerable.Range(0, keys.Length)
+            .Where(shown.Contains)
+            .Select(index => $"[grey]{keys[index].Text[..keys[index].Key]}[/]{keys[index].Text[keys[index].Key..]}"));
+
+        return new Markup(Justify(line, status.Length == 0 ? "" : $"[grey]{Markup.Escape(status)}[/]", Width));
     }
 
-    /// <summary>Blank rows to the requested height, so a panel is always the size it was given.</summary>
+    /// <summary>
+    /// A line of explanation inside a panel, cut to the width rather than wrapped: a wrapped line
+    /// would make the panel taller than the height it was drawn to.
+    /// </summary>
+    private static IRenderable Note(string text, int width) =>
+        new Markup($"[grey]{Markup.Escape(Fit(text, width, pad: false))}[/]");
+
+    /// <summary>
+    /// Blank rows to the requested height, so a panel is always the size it was given. The blank is
+    /// a space rather than an empty string: an empty renderable takes up no row at all.
+    /// </summary>
     private static List<IRenderable> PadTo(List<IRenderable> lines, int height)
     {
         while (lines.Count < height)
         {
-            lines.Add(new Text(""));
+            lines.Add(new Text(" "));
         }
 
         return lines;
     }
 
-    private static IRenderable Framed(IRenderable content, string header) =>
+    private static IRenderable Framed(IRenderable content, string header, bool focused) =>
         new Panel(content)
             .Header($" {header} ")
             .Border(BoxBorder.Rounded)
-            .BorderColor(Color.Grey30)
+            .BorderColor(focused ? Color.SteelBlue : Color.Grey30)
             .Expand();
 
     // --- Text helpers -------------------------------------------------------
@@ -671,7 +1140,7 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
 
         if (Cells(text) > width)
         {
-            var kept = new System.Text.StringBuilder();
+            var kept = new StringBuilder();
             var used = 0;
 
             foreach (var rune in text.EnumerateRunes())
@@ -686,13 +1155,59 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
                 used += size;
             }
 
-            return kept.Append('…').ToString().PadRight(width - used - 1 + kept.Length);
+            kept.Append('…');
+            used++;
+
+            return pad ? kept.Append(' ', width - used).ToString() : kept.ToString();
         }
 
         return pad ? text + new string(' ', width - Cells(text)) : text;
     }
 
     private static string Pad(string text, int width) => Fit(text, Math.Max(1, width));
+
+    /// <summary>
+    /// One line of text broken over as many rows as it needs, with continuations indented so the
+    /// block reads as one entry. Anything past maxRows is dropped, with an ellipsis to say so.
+    /// </summary>
+    private static List<string> Wrap(string text, int width, int maxRows)
+    {
+        if (width <= 2)
+        {
+            return [Fit(text, Math.Max(1, width), pad: false)];
+        }
+
+        const string indent = "  ";
+
+        var rows = new List<string>();
+        var current = new StringBuilder();
+        var used = 0;
+
+        foreach (var rune in text.EnumerateRunes())
+        {
+            var size = Cells(rune.ToString());
+
+            if (used + size > width)
+            {
+                rows.Add(current.ToString());
+                current.Clear().Append(indent);
+                used = indent.Length;
+            }
+
+            current.Append(rune);
+            used += size;
+        }
+
+        rows.Add(current.ToString());
+
+        if (rows.Count > maxRows)
+        {
+            rows.RemoveRange(maxRows, rows.Count - maxRows);
+            rows[^1] = Fit(rows[^1] + "…", width, pad: false);
+        }
+
+        return rows;
+    }
 
     /// <summary>Left and right fragments on one line; both may contain markup, so measure plainly.</summary>
     private static string Justify(string left, string right, int width)
