@@ -9,8 +9,8 @@ Nothing has to be registered, configured or instrumented. If a .NET app is runni
 rtop  2 processes in 1 worktree                                                               15:35:42
 ╭─worktrees  1-6 of 9────────────────────────────────────────────────────────────────────────────────╮
 │ * checkout-totals [claude]  feature/checkout-totals                                                │
-│     Shop.Api               pid 50663   5000,5001       6m       log                                │
-│     Shop.Worker            pid 12008   -               35m      log                                │
+│     Shop.Api                  pid 50663   5000,5001  6m       log                                  │
+│     Shop.Worker               pid 12008   -          35m      log                                  │
 │ - myapp [main]  main                                                                               │
 │ - basket-rounding [claude]  fix/basket-rounding                                                    │
 │ - myapp-wt1  spike/search-ranking                                                                  │
@@ -19,11 +19,17 @@ rtop  2 processes in 1 worktree                                                 
 │ [api] [15:30:15 INF] Now listening on: https://localhost:5001                                      │
 │ [api] [15:30:20 WRN] The 'Cache-Control' and 'Pragma' headers have been overridden and set to 'no-…│
 ╰────────────────────────────────────────────────────────────────────────────────────────────────────╯
-↑↓ select  open  stop  all  toggle src  filter  level  PgUp/PgDn scroll  quit
+↑↓ select  tab read log  open  stop  all  toggle src  filter  level  PgUp/PgDn scroll  quit
 ```
 
 It is built for working across several worktrees of the same repository at once, where two copies of
 the same service can be running on different ports and it is not obvious which is which.
+
+That is also what decides the layout in a narrow terminal. Rather than let the table run off the
+edge, columns are given up as the window shrinks — first the log marker, then the uptime, then the
+process name is squeezed, then the pid — and the ports are the last thing standing, because which
+copy is on which port is the question the screen exists to answer. Branch names go the same way,
+after the worktree name they belong to.
 
 ## Requirements
 
@@ -100,6 +106,7 @@ one still cannot see it, that shell captured PATH before the change; open a new 
 | | |
 | --- | --- |
 | `↑` `↓` / `k` `j` | move the selection; the log pane follows it |
+| `tab` | step into the log to read a line in full, and back out again — `esc` also steps back out |
 | `PgUp` `PgDn` | scroll the log — `Home` and `End` jump to either end |
 | `o` | open the selected process's port in a browser |
 | `s` | SIGTERM the runner behind the selected process (asks first) |
@@ -109,6 +116,23 @@ one still cannot see it, that shell captured PATH before the change; open a new 
 | `l` | cycle the level floor: all, warnings, errors (Seq only) |
 | `r` | refresh now |
 | `q` | quit |
+
+**`tab`** hands the arrow keys to the log. Every log line is drawn on one row and cut off at the
+edge of the screen, because a stack trace that wraps buries the timestamps you are scanning for —
+but the line you step onto is shown in full, wrapped over as many rows as it needs:
+
+```
+╭─log  Shop.Api  /Users/you/dev/myapp/.git/run-logs/…  line 1841 of 2000──────╮
+│ [api]    at Shop.Api.Basket.BasketTotals.Recalculate(Basket basket, Cancel… │
+│ [api] [15:31:02 ERR] An error occurred using the connection to database 'sh │
+│   op_checkout_totals' on server 'tcp://localhost:5432'.                     │
+│ [api]    at Npgsql.Internal.NpgsqlConnector.ConnectAsync(NpgsqlTimeout tim… │
+╰─────────────────────────────────────────────────────────────────────────────╯
+↑↓ line  esc back  Home/End ends  open  stop  quit
+```
+
+The read line follows its own text as the tail scrolls under it, so it stays on the entry you put
+it on rather than sliding onto whatever the next line to arrive pushes into that position.
 
 **`o`** probes the port with a TLS handshake before opening it, because a dev server commonly
 listens on an https and an http port with nothing in the number to tell them apart.

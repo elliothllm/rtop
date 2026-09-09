@@ -34,6 +34,14 @@ public static class LogTail
             }
 
             var split = Encoding.UTF8.GetString([.. buffer]).Split('\n');
+
+            // A file that ends in a newline has that many lines, not one more: the empty remainder
+            // after the last one is not a line of log.
+            if (split is [.., ""])
+            {
+                split = split[..^1];
+            }
+
             var trimmed = split.Length <= lines ? split : split[^lines..];
 
             return [.. trimmed.Select(line => line.TrimEnd('\r'))];
