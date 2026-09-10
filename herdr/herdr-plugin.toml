@@ -1,0 +1,35 @@
+# rtop as a herdr plugin: every new tab gets an rtop pane at the bottom of the
+# herdr-sidebar column, so what is running is always on screen.
+#
+# macOS only, because rtop is: discovery is built on ps and lsof.
+#
+# The hook is deliberately a shell script rather than a [[panes]] entry. A
+# declarative pane can be opened by `herdr plugin pane open`, but it cannot wait
+# for the sidebar column to exist first, and nothing orders two plugins that
+# listen to the same event.
+
+id = "rtop"
+name = "rtop"
+version = "0.1.0"
+description = "Docks rtop under the sidebar in every new tab: what .NET is running, and out of which worktree."
+min_herdr_version = "0.8.0"
+platforms = ["macos"]
+
+# A new tab, and the first tab of a new workspace — which is created without a
+# tab.created of its own. Both also fire when a restarted server restores its
+# session, which is how a pane whose rtop did not survive the restart gets
+# refilled.
+[[events]]
+on = "tab.created"
+command = ["bash", "scripts/ensure-rtop.sh"]
+
+[[events]]
+on = "workspace.created"
+command = ["bash", "scripts/ensure-rtop.sh"]
+
+# For a tab that predates the plugin, or one whose pane was closed on purpose.
+[[actions]]
+id = "rtop-dock"
+title = "Dock rtop in this tab"
+description = "Add the rtop pane to the focused tab if it does not have a live one."
+command = ["bash", "scripts/ensure-rtop.sh"]

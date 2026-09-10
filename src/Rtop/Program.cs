@@ -26,6 +26,11 @@ if (options.ShowVersion)
 
 var config = RtopConfig.Load();
 
+if (options.Refresh is { } refresh)
+{
+    config.RefreshSeconds = refresh;
+}
+
 if (options.WriteConfig)
 {
     config.Save();
@@ -54,7 +59,7 @@ if (Console.IsOutputRedirected)
     return 2;
 }
 
-using var dashboard = new Dashboard(config);
+using var dashboard = new Dashboard(config, showLog: !options.NoLog);
 await dashboard.RunAsync(interrupt.Token);
 return 0;
 
@@ -66,6 +71,8 @@ namespace Rtop
         public bool ShowHelp { get; init; }
         public bool ShowVersion { get; init; }
         public bool WriteConfig { get; init; }
+        public double? Refresh { get; init; }
+        public bool NoLog { get; init; }
         public string? Error { get; init; }
     }
 
@@ -84,10 +91,12 @@ namespace Rtop
               rtop --write-config  write the default config file and print its path
 
             OPTIONS
-              --json           machine-readable output instead of the dashboard
-              --write-config   create ~/.config/rtop/config.json
-              -h, --help       this text
-              -v, --version    version number
+              --json             machine-readable output instead of the dashboard
+              --refresh <secs>   how often to rescan, 0.5 to 60 (default 3, or the config)
+              --no-log           list only: drop the log pane, and stop reading logs at all
+              --write-config     create ~/.config/rtop/config.json
+              -h, --help         this text
+              -v, --version      version number
 
             KEYS (interactive)
               up / down, k / j   move the selection
@@ -111,11 +120,27 @@ namespace Rtop
         {
             var options = new CommandLineOptions();
 
-            foreach (var argument in args)
+            for (var index = 0; index < args.Length; index++)
             {
+                var argument = args[index];
+
+                if (argument == "--refresh")
+                {
+                    // Out-of-range values are clamped rather than refused, exactly as the same
+                    // setting is when it comes from the config file.
+                    if (index + 1 >= args.Length || !double.TryParse(args[++index], out var seconds))
+                    {
+                        return options with { Error = "--refresh needs a number of seconds" };
+                    }
+
+                    options = options with { Refresh = Math.Clamp(seconds, 0.5, 60) };
+                    continue;
+                }
+
                 options = argument switch
                 {
                     "--json" => options with { Json = true },
+                    "--no-log" => options with { NoLog = true },
                     "--write-config" => options with { WriteConfig = true },
                     "-h" or "--help" => options with { ShowHelp = true },
                     "-v" or "--version" => options with { ShowVersion = true },

@@ -117,6 +117,9 @@ one still cannot see it, that shell captured PATH before the change; open a new 
 | `r` | refresh now |
 | `q` | quit |
 
+Under `--no-log` the log keys go with the pane they drove: `PgUp` and `PgDn` page the list instead,
+and `Home` and `End` jump to its ends.
+
 **`tab`** hands the arrow keys to the log. Every log line is drawn on one row and cut off at the
 edge of the screen, because a stack trace that wraps buries the timestamps you are scanning for —
 but the line you step onto is shown in full, wrapped over as many rows as it needs:
@@ -141,7 +144,8 @@ listens on an https and an http port with nothing in the number to tell them apa
 start it again. The runner is found by walking up the ancestry while each parent is a recognised
 dev runner (`dotnet`, `node`, `npm`, `task`, `make`, …), and the walk stops the moment it is not —
 so it can never climb out into your shell or terminal emulator. The confirmation names the exact
-pid and command before anything is sent.
+pid and command before anything is sent — and in a pane too narrow for all of that, gives up the
+detail rather than the `y / n`, down to a bare `Stop runner?  y/n`.
 
 ## How it finds things
 
@@ -248,6 +252,50 @@ Running `rtop` with stdout redirected exits 2 and points at `--json` rather than
 - **`seq`** — `{ "url": "http://localhost:5341", "username": "…", "password": "…" }`, or an
   `apiKey` instead of the login, or blank credentials for an unauthenticated Seq.
 
+Two of those settings can also be given per invocation, which is what a second rtop in a small pane
+wants without changing the one you run full screen:
+
+| | |
+| --- | --- |
+| `--refresh <seconds>` | how often to rescan, 0.5 to 60. Every instance costs a `ps` and two `lsof` spawns each time round, so a screen you only glance at should ask less often than every 3s |
+| `--no-log` | drop the log pane. The worktree list then has the whole window, and no log is read at all — neither the file tail nor the Seq query |
+
+## In herdr
+
+[herdr](https://herdr.dev) can open rtop in every new tab, underneath the
+[herdr-sidebar](https://github.com/alexarthurs/herdr-sidebar) column if you run one:
+
+```bash
+./herdr/install.sh            # link the plugin and reload herdr
+./herdr/install.sh --uninstall
+```
+
+```
+╭─Sidebar───────────╮
+│  the sidebar      │   Nothing is shared between the instances, because there
+│  column, if you   │   is nothing to share: rtop holds no state, and derives
+│  have one         │   every screen from ps, lsof and git each time round. A
+├─rtop──────────────┤   pane per tab is just a second reader of the machine.
+│ * checkout-totals │
+│     Shop.Api 5001 │   The pane runs `rtop --refresh 15 --no-log`, so a column
+│     Shop.Worker   │   this narrow costs one scan every 15s and no log reads.
+╰───────────────────╯
+```
+
+Tabs that already exist keep the layout they have. To dock rtop into one of them, run the plugin's
+action:
+
+```bash
+herdr plugin action invoke rtop-dock --plugin rtop
+```
+
+Settings live in `~/.config/herdr/plugins/config/rtop/config.env`, which the installer seeds with a
+commented copy of the defaults: rtop's share of the column, the refresh interval, the arguments the
+pane is started with, and a `trace` switch that explains a hook run which did nothing
+(`herdr plugin log list --plugin rtop`).
+
+The plugin is *linked* rather than copied, so it runs out of this checkout and updates with it.
+
 ## Layout
 
 ```
@@ -262,6 +310,13 @@ src/Rtop/
     UrlProbe.cs         TLS handshake to pick http:// or https://
   Logs/                 file tail vs. Seq query behind one interface
   Tui/Dashboard.cs      the interactive screen
+
+herdr/
+  herdr-plugin.toml     the plugin manifest: which events dock a pane
+  install.sh            link it into herdr, and seed its settings file
+  scripts/
+    ensure-rtop.sh      the hook body: one rtop pane per tab, idempotent
+    panes.py            the JSON reading that hook needs
 ```
 
 ## Notes
