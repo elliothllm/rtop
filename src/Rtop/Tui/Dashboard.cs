@@ -11,8 +11,11 @@ namespace Rtop.Tui;
 /// <summary>
 /// The interactive screen: a list of worktrees and the .NET processes running out of them, over a
 /// log pane that follows whatever is selected.
+///
+/// With <paramref name="showLog"/> off the log pane is gone and no log is ever read — what is left
+/// is the worktree list on its own, for a pane too small to have shown a log usefully anyway.
 /// </summary>
-public sealed class Dashboard(RtopConfig config) : IDisposable
+public sealed class Dashboard(RtopConfig config, bool showLog = true) : IDisposable
 {
     private sealed record Row(Worktree Worktree, DotnetProcess? Process)
     {
@@ -67,7 +70,14 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
 
     private bool _dirty = true;
     private DateTimeOffset _lastDraw = DateTimeOffset.MinValue;
-    private string? _confirmPrompt;
+
+    /// <summary>
+    /// The confirmation, written several times over from longest to shortest. The bar is one line
+    /// and cannot wrap, so a narrow terminal gives up detail rather than the `y / n` on the end —
+    /// a question you cannot see the answer to is worse than a vague one.
+    /// </summary>
+    private IReadOnlyList<string>? _confirmPrompt;
+
     private Action? _confirmAction;
     private bool _running = true;
 
@@ -208,6 +218,11 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
 
     private void PumpLog(CancellationToken cancellationToken)
     {
+        if (!showLog)
+        {
+            return;
+        }
+
         var row = CurrentRow();
         var key = row?.Process is { } process
             ? $"{(_preferSeq ? "seq" : "auto")}:{process.ExecutablePath}"
@@ -395,11 +410,16 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
             return;
         }
 
-        var page = Math.Max(1, LogHeight() - 1);
+        var page = Math.Max(1, (showLog ? LogHeight() : ListHeight()) - 1);
 
         switch (key.Key)
         {
             case ConsoleKey.Tab:
+                if (!showLog)
+                {
+                    return;
+                }
+
                 if (_focus == Pane.Log)
                 {
                     FocusList();
@@ -412,7 +432,11 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
                 return;
 
             case ConsoleKey.Enter:
-                FocusLog();
+                if (showLog)
+                {
+                    FocusLog();
+                }
+
                 return;
 
             case ConsoleKey.UpArrow:
@@ -432,7 +456,11 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
                 return;
 
             case ConsoleKey.Home:
-                if (_focus == Pane.Log)
+                if (!showLog)
+                {
+                    _selected = 0;
+                }
+                else if (_focus == Pane.Log)
                 {
                     SetLogCursor(0);
                 }
@@ -444,7 +472,11 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
                 return;
 
             case ConsoleKey.End:
-                if (_focus == Pane.Log)
+                if (!showLog)
+                {
+                    _selected = Math.Max(0, _rows.Count - 1);
+                }
+                else if (_focus == Pane.Log)
                 {
                     SetLogCursor(_logLines.Count - 1);
                 }
@@ -495,11 +527,21 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
                 break;
 
             case 'f':
+                if (!showLog)
+                {
+                    break;
+                }
+
                 _logFilter = _logFilter with { ApplicationOnly = !_logFilter.ApplicationOnly };
                 _lastLogRead = DateTimeOffset.MinValue;
                 break;
 
             case 'l':
+                if (!showLog)
+                {
+                    break;
+                }
+
                 _logFilter = _logFilter with
                 {
                     Floor = _logFilter.Floor switch
@@ -513,6 +555,11 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
                 break;
 
             case 't':
+                if (!showLog)
+                {
+                    break;
+                }
+
                 if (_seq is null)
                 {
                     _status = "no seq configured";
@@ -545,9 +592,9 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
         {
             MoveLogCursor(-lines);
         }
-        else if (lines == 1)
+        else if (lines == 1 || !showLog)
         {
-            Move(-1);
+            Move(-lines);
         }
         else
         {
@@ -561,9 +608,9 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
         {
             MoveLogCursor(lines);
         }
-        else if (lines == 1)
+        else if (lines == 1 || !showLog)
         {
-            Move(1);
+            Move(lines);
         }
         else
         {
@@ -616,11 +663,26 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
         // Signalling the application alone achieves nothing when a watcher owns it: the watcher
         // simply starts it again. The runner is what has to go.
         var target = process.RunnerPid ?? process.Pid;
-        var what = process.RunnerPid is null
-            ? $"{process.Name} (pid {process.Pid})"
-            : $"the runner of {process.Name} (pid {target})";
 
-        _confirmPrompt = $"SIGTERM {what}?  y / n";
+        // What goes first as the bar narrows: the word SIGTERM, then the pid, then the name. What
+        // is left at the end still says that something is about to be stopped and how to say yes.
+        _confirmPrompt = process.RunnerPid is null
+            ?
+            [
+                $"SIGTERM {process.Name} (pid {target})?  y / n",
+                $"Stop {process.Name} ({target})?  y / n",
+                $"Stop process {target}?  y / n",
+                "Stop process?  y/n",
+                "Stop? y/n",
+            ]
+            :
+            [
+                $"SIGTERM the runner of {process.Name} (pid {target})?  y / n",
+                $"Stop the runner of {process.Name} ({target})?  y / n",
+                $"Stop runner {target}?  y / n",
+                "Stop runner?  y/n",
+                "Stop? y/n",
+            ];
         _confirmAction = () =>
         {
             try
@@ -647,9 +709,10 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
     private int Height => Math.Max(12, AnsiConsole.Profile.Height);
 
     /// <summary>Rows for the two panes to divide: what the header, footer and borders leave over.</summary>
-    private int Available => Math.Max(2, Height - 7);
+    private int Available => Math.Max(2, Height - (showLog ? 7 : 5));
 
-    private int ListHeight() => Math.Clamp(Math.Max(_rows.Count, 3), 1, Math.Max(1, Available / 2));
+    private int ListHeight() =>
+        showLog ? Math.Clamp(Math.Max(_rows.Count, 3), 1, Math.Max(1, Available / 2)) : Available;
 
     private int LogHeight() => Math.Max(1, Available - ListHeight());
 
@@ -658,7 +721,9 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
     /// make the trailing newline scroll the display, and the header would be the line lost.
     /// </summary>
     private IRenderable Frame() =>
-        new Rows(Header(), ListPanel(ListHeight()), LogPanel(LogHeight()), Footer());
+        showLog
+            ? new Rows(Header(), ListPanel(ListHeight()), LogPanel(LogHeight()), Footer())
+            : new Rows(Header(), ListPanel(ListHeight()), Footer());
 
     private IRenderable Header()
     {
@@ -1043,9 +1108,12 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
 
     private IRenderable Footer()
     {
-        if (_confirmPrompt is not null)
+        if (_confirmPrompt is { Count: > 0 } prompts)
         {
-            return new Markup($"[black on yellow] {Markup.Escape(Pad(_confirmPrompt, Width - 2))} [/]");
+            var bar = Width - 2;
+            var prompt = prompts.FirstOrDefault(text => Cells(text) <= bar) ?? prompts[^1];
+
+            return new Markup($"[black on yellow] {Markup.Escape(Pad(prompt, bar))} [/]");
         }
 
         var status = _status is null ? "" : Fit(_status, Math.Max(8, Width / 2), pad: false);
@@ -1063,7 +1131,8 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
                 ("stop", 1, 4),
                 ("quit", 1, 2),
             ]
-            :
+            : showLog
+            ?
             [
                 ("↑↓ select", 2, 0),
                 ("tab read log", 3, 2),
@@ -1074,6 +1143,15 @@ public sealed class Dashboard(RtopConfig config) : IDisposable
                 ("filter", 1, 7),
                 ("level", 1, 6),
                 ("PgUp/PgDn scroll", 9, 9),
+                ("quit", 1, 1),
+            ]
+            :
+            [
+                ("↑↓ select", 2, 0),
+                ("open", 1, 2),
+                ("stop", 1, 3),
+                ("all", 1, 4),
+                ("PgUp/PgDn page", 9, 5),
                 ("quit", 1, 1),
             ];
 
